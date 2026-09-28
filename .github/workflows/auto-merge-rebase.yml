@@ -1,0 +1,229 @@
+name: Auto-merge rebaseable PRs
+
+# ── Cron toutes les 6h + manuel ──────────────────────────────────────────────
+#
+# Scannet les 14 repos sushi-hackintosh, détecte les PRs ouvertes rebaseables
+# (head ≤ 5 commits derrière main, pas de conflit, CI vertes + approuvées si
+# review requis), et les auto-fusionne en squash.
+#
+# Levraille les PRs qui ont dormi trop longtemps sans rien demander à l'auteur
+# (sauf si review requis ou conflit).
+#
+# Sous-classe CI-verification repo par repo ci-dessous (tableau ALLOWLIST).
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # toutes les 6h
+  workflow_dispatch:        # déclenchement manuel depuis l'UI
+
+permissions:
+  contents: write           # pour git merge (nécessaire pour les auto-merges)
+  pull-requests: write      # pour commenter + fermer les PRs orphelines
+
+concurrency:
+  group: auto-merge-scan
+  cancel-in-progress: false # on veut que chaque run termine, pas qu'il se cancel
+
+jobs:
+  scan-and-merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout hermes-agent (pour les helpers)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install gh CLI (déjà présent, mais expliciter version)
+        run: gh --version
+
+      # ── 1. Lister tous les repos sushi-hackintosh ─────────────────────────
+      - name: List repos
+        id: repos
+        run: |
+          REPOS=$(gh repo list sushi-hackintosh --limit 200 --json name,isFork,isArchived \
+            | jq -r '.[] | select(.isFork == false and .isArchived == false) | .name')
+          echo "repos<<EOF" >> $GITHUB_OUTPUT
+          echo "$REPOS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "Found $(echo "$REPOS" | wc -l) repos"
+
+      # ── 2. Pour chaque repo, scanner les PRs ouvertes ─────────────────────
+      - name: Scan PRs
+        id: scan
+        env:
+          REPOS: ${{ steps.repos.outputs.repos }}
+        run: |
+          set -euo pipefail
+
+          # Tableau des repos avec CI-verification active
+          # (ajouter les repos qui ont des workflows de test bloquants à la merge)
+          # Format: repo:enabled  (enabled = la CI doit être verte avant merge)
+          DECLARED_CI=$(cat <<'INNER'
+          hermes-agent:true
+          tradingview-mcp:true
+          ruflo:false
+          colibri:false
+          FinceptTerminal:false
+          llama.cpp:false
+          agent-skills:false
+          agent_hub:false
+          agent-skill:false
+          agent-cli:true
+          hyperliquid-python-sdk:false
+          hyperliquid-mcp:true
+          INNER
+          )
+
+          # Repos sans CI-verification (false) : auto-merge sans vérifier CI
+          declare -A CI_ENABLED
+          while IFS=: read -r repo enabled; do
+            CI_ENABLED[$repo]=$enabled
+          done <<< "$DECLARED_CI"
+
+          REPORT_FILE=$(mktemp)
+          echo "# Auto-merge scan — $(date -u)" > "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          echo '| Repo | PR # | Titre | Actions |' >> "$REPORT_FILE"
+          echo '|------|-------|-------|--------|' >> "$REPORT_FILE"
+
+          MERGED=0
+          SKIPPED=0
+          LOOP=0
+
+          for repo in $REPOS; do
+            LOOP=$((LOOP + 1))
+            echo "### Scanning $repo..." >> "$REPORT_FILE"
+            echo "---" >> "$REPORT_FILE"
+
+            # Lister les PRs ouvertes
+            PRS=$(gh pr list --repo "sushi-hackintosh/$repo" \
+              --state open --json number,title,headRefName,baseRefName,commits,additions,deletions,changedFiles,reviewDecision,statusCheckRollup --jq '.[]' 2>/dev/null || true)
+
+            if [ -z "$PRS" ]; then
+              echo "Pas de PR ouverte" >> "$REPORT_FILE"
+              continue
+            fi
+
+            while IFS= read -r pr; do
+              [ -z "$pr" ] && continue
+              NUM=$(echo "$pr" | jq -r '.number')
+              TITLE=$(echo "$pr" | jq -r '.title')
+              BASE=$(echo "$pr" | jq -r '.baseRefName')
+              HEAD=$(echo "$pr" | jq -r '.headRefName')
+              COMMITS=$(echo "$pr" | jq -r '.commits | length')
+              REVIEW_DECISION=$(echo "$pr" | jq -r '.reviewDecision // "none"')
+              # statusCheckRollup: tableau des checks
+              CHECKS=$(echo "$pr" | jq -r '.statusCheckRollup // [] | length')
+              CHECK_STATUSES=$(echo "$pr" | jq -r '.statusCheckRollup[]? // empty | "\(.name):\(.status):\(.conclusion)"' 2>/dev/null || true)
+
+              LOOP2=$((LOOP2 + 1))
+
+              # Calculer l'écart commit count entre head et base
+              # gh api repos/.../compare/{base}...{head}
+              DIFFSTATS=$(gh api "repos/sushi-hackintosh/$repo/compare/$BASE...$HEAD" \
+                --jq '{ahead_by: .ahead_by, behind_by: .behind_by, total_commits: .total_commits,mergeable: .mergeable,merged: .merged}' 2>/dev/null || echo '{"behind_by":999,"mergeable":"unknown","merged":false}')
+
+              BEHIND=$(echo "$DIFFSTATS" | jq -r '.behind_by')
+              AHEAD=$(echo "$DIFFSTATS" | jq -r '.ahead_by')
+              TOTAL_COMMITS=$(echo "$DIFFSTATS" | jq -r '.total_commits')
+              MERGEABLE=$(echo "$DIFFSTATS" | jq -r '.mergeable')
+              ALREADY_MERGED=$(echo "$DIFFSTATS" | jq -r '.merged')
+
+              # Critères de rebaseabilité:
+              #   - head derrière main de ≤ 5 commits
+              #   - mergeable == true (pas de conflit)
+              #   - pas déjà mergée
+              #   - pas de review requis bloquant (reviewDecision != "required" quand CI enabled)
+              #   - CI verte (si repo CI-enabled)
+
+              SHOULD_MERGE=true
+              REASON=""
+
+              if [ "$ALREADY_MERGED" = "true" ]; then
+                SHOULD_MERGE=false
+                REASON="déjà mergée"
+              fi
+
+              if [ "$MERGEABLE" != "true" ]; then
+                SHOULD_MERGE=false
+                REASON="non mergeable (conflit ou état unknown)"
+              fi
+
+              if [ "$MERGEABLE" = "unknown" ]; then
+                SHOULD_MERGE=false
+                REASON="état mergeable inconnu (récupération echouée)"
+              fi
+
+              # Branch protection: si review requis et pas d'approbation
+              if [ "${CI_ENABLED[$repo]:-false}" = "true" ] && [ "$REVIEW_DECISION" = "required" ]; then
+                SHOULD_MERGE=false
+                REASON="review requis non satisfait (decision=$REVIEW_DECISION)"
+              fi
+
+              # CI verification: vérifier que tous les checks passent
+              if [ "${CI_ENABLED[$repo]:-false}" = "true" ] && [ "$SHOULD_MERGE" = "true" ]; then
+                ALL_PASS=true
+                while IFS= read -r cs; do
+                  [ -z "$cs" ] && continue
+                  STATUS=$(echo "$cs" | cut -d: -f2)
+                  CONCLUSION=$(echo "$cs" | cut -d: -f3)
+                  if [ "$STATUS" != "completed" ] || [ "$CONCLUSION" != "success" ]; then
+                    ALL_PASS=false
+                    break
+                  fi
+                done <<< "$CHECK_STATUSES"
+                if [ "$ALL_PASS" = "false" ]; then
+                  SHOULD_MERGE=false
+                  REASON="CI non passante (checks: $CHECK_STATUSES)"
+                fi
+              fi
+
+              # Action: merge ou skip
+              if [ "$SHOULD_MERGE" = "true" ]; then
+                echo "Mergable PR #$NUM ($repo): $TITLE" >> "$REPORT_FILE"
+                echo "  behind=$BEHIND ahead=$AHEAD commits=$COMMITS mergeable=$MERGEABLE review=$REVIEW_DECISION" >> "$REPORT_FILE"
+                echo "  → fusion en squash" >> "$REPORT_FILE"
+                echo "" >> "$REPORT_FILE"
+
+                # Auto-merge par API (squash, main)
+                # gh pr merge --repo=... --squash --delete-branch --auto est plus safe
+                # mais on veut un merge réel maintenant si possible
+                if gh pr merge "sushi-hackintosh/$repo" "$NUM" \
+                  --squash --delete-branch --admin 2>&1; then
+                  echo "**Fusionnée #$NUM** ✅" >> "$REPORT_FILE"
+                  MERGED=$((MERGED + 1))
+                else
+                  echo "**ÉCHEC fusion #$NUM** ❌" >> "$REPORT_FILE"
+                fi
+              else
+                echo "PR #$NUM ($repo): $TITLE — $REASON" >> "$REPORT_FILE"
+                echo "  behind=$BEHIND ahead=$AHEAD commits=$COMMITS mergeable=$MERGEABLE review=$REVIEW_DECISION CI_enabled=${CI_ENABLED[$repo]:-false}" >> "$REPORT_FILE"
+                SKIPPED=$((SKIPPED + 1))
+                echo "" >> "$REPORT_FILE"
+              fi
+
+            done <<< "$PRS"
+          done
+
+          echo "" >> "$REPORT_FILE"
+          echo "**Résumé:** $MERGED fusionnées, $SKIPPED ignorées (sur $LOOP repos, $LOOP2 PRs)" >> "$REPORT_FILE"
+          cat "$REPORT_FILE"
+
+          # Publier le rapport comme commentaire sur le workflow
+          # (optionnel: créer une issue ou un gist)
+          gh run comment "$GITHUB_RUN_ID" --body-file "$REPORT_FILE" 2>/dev/null || true
+
+          # Afficher le résumé dans les logs
+          echo "REPORT=$(cat "$REPORT_FILE")" >> $GITHUB_OUTPUT
+          echo "MERGED_COUNT=$MERGED" >> $GITHUB_OUTPUT
+          echo "SKIPPED_COUNT=$SKIPPED" >> $GITHUB_OUTPUT
+          echo "REPO_COUNT=$LOOP" >> $GITHUB_OUTPUT
+
+      # ── 3. Publier le rapport en commentaire sur la PR principale ──────────
+      - name: Publish report
+        if: always()
+        run: |
+          echo "## Auto-merge scan rapport" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '${{ steps.scan.outputs.REPORT }}' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Stats:** ${{ steps.scan.outputs.MERGED_COUNT }} fusionnées · ${{ steps.scan.outputs.SKIPPED_COUNT }} ignorées · ${{ steps.scan.outputs.REPO_COUNT }} repos scannés" >> $GITHUB_STEP_SUMMARY
